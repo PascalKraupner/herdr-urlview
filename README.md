@@ -40,7 +40,7 @@ height = "60%"
 - `fzf`
 - `xdg-open` or `gio` on Linux, `open` on macOS
 - `wl-copy`, `xclip` or `pbcopy` for the copy binding
-- Python 3.9 or newer
+- nothing else; it is a static Go binary
 
 ## Configuration
 
