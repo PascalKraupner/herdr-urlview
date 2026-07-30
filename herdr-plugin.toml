@@ -1,0 +1,22 @@
+id = "urlview"
+name = "urlview"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Pick and open URLs from the focused pane. A herdr equivalent of tmux-urlview."
+platforms = ["linux", "macos"]
+
+# Downloads the prebuilt binary for this platform from the GitHub release, so
+# installing needs nothing but curl and tar. Falls back to `go build` only if no
+# matching asset exists. Compiling on the installer's machine would defeat the
+# point of writing this in Go.
+[[build]]
+command = ["sh", "scripts/fetch-binary.sh"]
+
+# A popup so the fzf picker is interactive without disturbing the tab layout.
+[[panes]]
+id = "pick"
+title = "URLs"
+placement = "popup"
+width = "80%"
+height = "60%"
+command = ["bin/herdr-urlview"]
