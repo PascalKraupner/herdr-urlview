@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Pick a URL out of a herdr pane and open or copy it.
+
+A herdr port of tmux-urlview. Reads the invoking pane's scrollback through the
+herdr socket API, extracts URLs, and offers them in an fzf picker.
+
+Enter   open in the default browser
+Ctrl-Y  copy to the clipboard instead
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+# Deliberately conservative: terminals wrap and decorate output, so anything
+# clever produces more false positives than it recovers real links.
+URL_RE = re.compile(
+    r"""(?xi)
+    (
+        (?:https?|ftp|file)://[^\s<>"'`\[\]{}|\\^]+
+        |
+        www\.[^\s<>"'`\[\]{}|\\^]+
+    )
+    """
+)
+
+# Punctuation that is far more likely to be prose than part of the URL.
+TRAILING = ".,;:!?'\")]}>"
+
+DEFAULT_LINES = 5000
+
+
+def herdr_bin() -> str:
+    return os.environ.get("HERDR_BIN_PATH") or "herdr"
+
+
+def run(args: list[str]) -> str:
+    result = subprocess.run(
+        args, capture_output=True, text=True, check=False
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"{' '.join(args)} failed ({result.returncode}): {result.stderr.strip()}"
+        )
+    return result.stdout
+
+
+def source_pane_id() -> str:
+    """Resolve the pane whose output we should scan.
+
+    herdr passes the invoking pane in the environment. When it does not (for
+    example when the plugin is run by hand), fall back to whichever pane the
+    server currently reports as focused.
+    """
+    pane = os.environ.get("HERDR_PANE_ID")
+    if pane:
+        return pane
+
+    context = os.environ.get("HERDR_PLUGIN_CONTEXT_JSON")
+    if context:
+        try:
+            data = json.loads(context)
+        except json.JSONDecodeError:
+            data = {}
+        pane = data.get("pane_id") or (data.get("pane") or {}).get("pane_id")
+        if pane:
+            return pane
+
+    payload = json.loads(run([herdr_bin(), "pane", "list"]))
+    panes = payload.get("result", {}).get("panes", [])
+    for entry in panes:
+        if entry.get("focused"):
+            return entry["pane_id"]
+    if panes:
+        return panes[0]["pane_id"]
+    raise RuntimeError("no panes reported by herdr")
+
+
+def pane_text(pane_id: str, lines: int) -> str:
+    return run(
+        [
+            herdr_bin(),
+            "pane",
+            "read",
+            pane_id,
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            str(lines),
+            "--format",
+            "text",
+        ]
+    )
+
+
+def extract(text: str) -> list[str]:
+    seen: dict[str, None] = {}
+    for match in URL_RE.finditer(text):
+        url = match.group(1).rstrip(TRAILING)
+
+        # Keep a closing paren that belongs to the URL, e.g. wiki_(disambiguation)
+        if url.count("(") > url.count(")") and match.group(1).endswith(")"):
+            url += ")"
+
+        if len(url) < 8:
+            continue
+        seen.setdefault(url, None)
+
+    # Most recent output is at the bottom, and that is usually what you want.
+    return list(reversed(list(seen)))
+
+
+def pick(urls: list[str]) -> tuple[str, str] | None:
+    fzf = shutil.which("fzf")
+    if not fzf:
+        raise RuntimeError("fzf is required but was not found on PATH")
+
+    result = subprocess.run(
+        [
+            fzf,
+            "--prompt=url> ",
+            "--height=100%",
+            "--reverse",
+            "--no-multi",
+            "--expect=ctrl-y",
+            f"--header=enter open   ctrl-y copy   ({len(urls)} found)",
+        ],
+        input="\n".join(urls),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # 130 is the conventional "user pressed escape or Ctrl-C" exit.
+    if result.returncode not in (0, 1, 130):
+        raise RuntimeError(f"fzf failed ({result.returncode})")
+
+    lines = result.stdout.splitlines()
+    if len(lines) < 2 or not lines[1].strip():
+        return None
+    return lines[0].strip(), lines[1].strip()
+
+
+def opener() -> list[str]:
+    if sys.platform == "darwin":
+        return ["open"]
+    for candidate in ("xdg-open", "gio"):
+        path = shutil.which(candidate)
+        if path:
+            return [path, "open"] if candidate == "gio" else [path]
+    raise RuntimeError("no xdg-open or gio found to open the URL")
+
+
+def copy(url: str) -> None:
+    for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["pbcopy"]):
+        if shutil.which(cmd[0]):
+            subprocess.run(cmd, input=url, text=True, check=False)
+            return
+    raise RuntimeError("no wl-copy, xclip or pbcopy found to copy the URL")
+
+
+def main() -> int:
+    try:
+        lines = int(os.environ.get("HERDR_URLVIEW_LINES", DEFAULT_LINES))
+    except ValueError:
+        lines = DEFAULT_LINES
+
+    try:
+        pane = source_pane_id()
+        urls = extract(pane_text(pane, lines))
+    except (RuntimeError, json.JSONDecodeError, KeyError) as exc:
+        print(f"herdr-urlview: {exc}", file=sys.stderr)
+        return 1
+
+    if not urls:
+        print(f"herdr-urlview: no URLs in the last {lines} lines of {pane}")
+        # Give the popup a moment to be readable before herdr tears it down.
+        input("press enter to close ")
+        return 0
+
+    try:
+        chosen = pick(urls)
+        if chosen is None:
+            return 0
+        key, url = chosen
+        if key == "ctrl-y":
+            copy(url)
+        else:
+            url = f"https://{url}" if url.startswith("www.") else url
+            subprocess.Popen(
+                opener() + [url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+    except RuntimeError as exc:
+        print(f"herdr-urlview: {exc}", file=sys.stderr)
+        input("press enter to close ")
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
