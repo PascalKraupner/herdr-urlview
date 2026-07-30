@@ -1,209 +1,195 @@
-#!/usr/bin/env python3
-"""Pick a URL out of a herdr pane and open or copy it.
+#!/usr/bin/env bun
+// Pick a URL out of a herdr pane and open or copy it.
+//
+// A herdr equivalent of tmux-urlview. Reads the invoking pane's scrollback
+// through the herdr socket API, extracts URLs, and offers them in an fzf picker.
+//
+//   Enter   open in the default browser
+//   Ctrl-Y  copy to the clipboard instead
+//   Esc     cancel
+//
+// HERDR_URLVIEW_LINES sets how much scrollback to scan (default 5000).
+//
+// Uses node: imports throughout, so it runs unchanged under node.
 
-A herdr port of tmux-urlview. Reads the invoking pane's scrollback through the
-herdr socket API, extracts URLs, and offers them in an fzf picker.
+import { existsSync } from "node:fs";
+import { join, delimiter } from "node:path";
+import { spawnSync, spawn } from "node:child_process";
 
-Enter   open in the default browser
-Ctrl-Y  copy to the clipboard instead
-"""
+// Deliberately conservative: terminals wrap and decorate output, so anything
+// clever produces more false positives than it recovers real links.
+const URL_RE =
+  /((?:https?|ftp|file):\/\/[^\s<>"'`\[\]{}|\\^]+|www\.[^\s<>"'`\[\]{}|\\^]+)/gi;
 
-from __future__ import annotations
+// Punctuation far more likely to be prose than part of the URL.
+const TRAILING = new Set([".", ",", ";", ":", "!", "?", "'", '"', ")", "]", "}", ">"]);
 
-import json
-import os
-import re
-import shutil
-import subprocess
-import sys
+const DEFAULT_LINES = 5000;
 
-# Deliberately conservative: terminals wrap and decorate output, so anything
-# clever produces more false positives than it recovers real links.
-URL_RE = re.compile(
-    r"""(?xi)
-    (
-        (?:https?|ftp|file)://[^\s<>"'`\[\]{}|\\^]+
-        |
-        www\.[^\s<>"'`\[\]{}|\\^]+
-    )
-    """
-)
+function which(name) {
+  for (const dir of (process.env.PATH || "").split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, name);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
 
-# Punctuation that is far more likely to be prose than part of the URL.
-TRAILING = ".,;:!?'\")]}>"
+function herdr(...args) {
+  const bin = process.env.HERDR_BIN_PATH || "herdr";
+  const result = spawnSync(bin, args, { encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(`herdr ${args.join(" ")} failed: ${(result.stderr || "").trim()}`);
+  }
+  return result.stdout;
+}
 
-DEFAULT_LINES = 5000
+// herdr passes the invoking pane in the environment. When it does not (run by
+// hand, or from a popup that carries no pane context), fall back to whichever
+// pane the server reports as focused.
+function sourcePaneId() {
+  if (process.env.HERDR_PANE_ID) return process.env.HERDR_PANE_ID;
 
+  const context = process.env.HERDR_PLUGIN_CONTEXT_JSON;
+  if (context) {
+    try {
+      const data = JSON.parse(context);
+      const pane = data?.pane_id ?? data?.pane?.pane_id;
+      if (pane) return pane;
+    } catch {}
+  }
 
-def herdr_bin() -> str:
-    return os.environ.get("HERDR_BIN_PATH") or "herdr"
+  const panes = JSON.parse(herdr("pane", "list"))?.result?.panes ?? [];
+  const focused = panes.find((p) => p.focused);
+  if (focused) return focused.pane_id;
+  if (panes.length) return panes[0].pane_id;
+  throw new Error("no panes reported by herdr");
+}
 
+function paneText(paneId, lines) {
+  return herdr(
+    "pane", "read", paneId,
+    "--source", "recent-unwrapped",
+    "--lines", String(lines),
+    "--format", "text",
+  );
+}
 
-def run(args: list[str]) -> str:
-    result = subprocess.run(
-        args, capture_output=True, text=True, check=False
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"{' '.join(args)} failed ({result.returncode}): {result.stderr.strip()}"
-        )
-    return result.stdout
+function extract(text) {
+  const seen = new Set();
 
+  for (const match of text.matchAll(URL_RE)) {
+    const raw = match[1];
 
-def source_pane_id() -> str:
-    """Resolve the pane whose output we should scan.
+    let url = raw;
+    while (url.length && TRAILING.has(url[url.length - 1])) url = url.slice(0, -1);
 
-    herdr passes the invoking pane in the environment. When it does not (for
-    example when the plugin is run by hand), fall back to whichever pane the
-    server currently reports as focused.
-    """
-    pane = os.environ.get("HERDR_PANE_ID")
-    if pane:
-        return pane
+    // Keep a closing paren that belongs to the URL, e.g. wiki_(disambiguation)
+    const opens = (url.match(/\(/g) || []).length;
+    const closes = (url.match(/\)/g) || []).length;
+    if (opens > closes && raw.endsWith(")")) url += ")";
 
-    context = os.environ.get("HERDR_PLUGIN_CONTEXT_JSON")
-    if context:
-        try:
-            data = json.loads(context)
-        except json.JSONDecodeError:
-            data = {}
-        pane = data.get("pane_id") or (data.get("pane") or {}).get("pane_id")
-        if pane:
-            return pane
+    if (url.length < 8) continue;
+    seen.add(url);
+  }
 
-    payload = json.loads(run([herdr_bin(), "pane", "list"]))
-    panes = payload.get("result", {}).get("panes", [])
-    for entry in panes:
-        if entry.get("focused"):
-            return entry["pane_id"]
-    if panes:
-        return panes[0]["pane_id"]
-    raise RuntimeError("no panes reported by herdr")
+  // Most recent output is at the bottom, and that is usually what you want.
+  return [...seen].reverse();
+}
 
+function pick(urls) {
+  const fzf = which("fzf");
+  if (!fzf) throw new Error("fzf is required but was not found on PATH");
 
-def pane_text(pane_id: str, lines: int) -> str:
-    return run(
-        [
-            herdr_bin(),
-            "pane",
-            "read",
-            pane_id,
-            "--source",
-            "recent-unwrapped",
-            "--lines",
-            str(lines),
-            "--format",
-            "text",
-        ]
-    )
+  const result = spawnSync(
+    fzf,
+    [
+      "--prompt=url> ",
+      "--height=100%",
+      "--reverse",
+      "--no-multi",
+      "--expect=ctrl-y",
+      `--header=enter open   ctrl-y copy   (${urls.length} found)`,
+    ],
+    { input: urls.join("\n"), encoding: "utf8", stdio: ["pipe", "pipe", "inherit"] },
+  );
 
+  // 130 is the conventional "user pressed escape or Ctrl-C" exit.
+  if (![0, 1, 130].includes(result.status)) {
+    throw new Error(`fzf failed (${result.status})`);
+  }
 
-def extract(text: str) -> list[str]:
-    seen: dict[str, None] = {}
-    for match in URL_RE.finditer(text):
-        url = match.group(1).rstrip(TRAILING)
+  const lines = (result.stdout || "").split("\n");
+  if (lines.length < 2 || !lines[1].trim()) return null;
+  return { key: lines[0].trim(), url: lines[1].trim() };
+}
 
-        # Keep a closing paren that belongs to the URL, e.g. wiki_(disambiguation)
-        if url.count("(") > url.count(")") and match.group(1).endswith(")"):
-            url += ")"
+function open(url) {
+  if (process.platform === "darwin") {
+    return spawn("open", [url], { detached: true, stdio: "ignore" }).unref();
+  }
+  const xdg = which("xdg-open");
+  if (xdg) return spawn(xdg, [url], { detached: true, stdio: "ignore" }).unref();
+  const gio = which("gio");
+  if (gio) return spawn(gio, ["open", url], { detached: true, stdio: "ignore" }).unref();
+  throw new Error("no xdg-open or gio found to open the URL");
+}
 
-        if len(url) < 8:
-            continue
-        seen.setdefault(url, None)
+function copy(url) {
+  for (const [name, args] of [
+    ["wl-copy", []],
+    ["xclip", ["-selection", "clipboard"]],
+    ["pbcopy", []],
+  ]) {
+    const bin = which(name);
+    if (bin) {
+      spawnSync(bin, args, { input: url, encoding: "utf8" });
+      return;
+    }
+  }
+  throw new Error("no wl-copy, xclip or pbcopy found to copy the URL");
+}
 
-    # Most recent output is at the bottom, and that is usually what you want.
-    return list(reversed(list(seen)))
+function pause() {
+  // Keeps the popup readable before herdr tears it down.
+  spawnSync("sh", ["-c", "read -r _"], { stdio: "inherit" });
+}
 
+function main() {
+  const parsed = Number.parseInt(process.env.HERDR_URLVIEW_LINES ?? "", 10);
+  const lines = Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_LINES;
 
-def pick(urls: list[str]) -> tuple[str, str] | None:
-    fzf = shutil.which("fzf")
-    if not fzf:
-        raise RuntimeError("fzf is required but was not found on PATH")
+  let pane;
+  let urls;
+  try {
+    pane = sourcePaneId();
+    urls = extract(paneText(pane, lines));
+  } catch (err) {
+    console.error(`herdr-urlview: ${err.message}`);
+    return 1;
+  }
 
-    result = subprocess.run(
-        [
-            fzf,
-            "--prompt=url> ",
-            "--height=100%",
-            "--reverse",
-            "--no-multi",
-            "--expect=ctrl-y",
-            f"--header=enter open   ctrl-y copy   ({len(urls)} found)",
-        ],
-        input="\n".join(urls),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    # 130 is the conventional "user pressed escape or Ctrl-C" exit.
-    if result.returncode not in (0, 1, 130):
-        raise RuntimeError(f"fzf failed ({result.returncode})")
+  if (!urls.length) {
+    console.log(`herdr-urlview: no URLs in the last ${lines} lines of ${pane}`);
+    pause();
+    return 0;
+  }
 
-    lines = result.stdout.splitlines()
-    if len(lines) < 2 or not lines[1].strip():
-        return None
-    return lines[0].strip(), lines[1].strip()
+  try {
+    const chosen = pick(urls);
+    if (!chosen) return 0;
+    if (chosen.key === "ctrl-y") {
+      copy(chosen.url);
+    } else {
+      open(chosen.url.startsWith("www.") ? `https://${chosen.url}` : chosen.url);
+    }
+  } catch (err) {
+    console.error(`herdr-urlview: ${err.message}`);
+    pause();
+    return 1;
+  }
 
+  return 0;
+}
 
-def opener() -> list[str]:
-    if sys.platform == "darwin":
-        return ["open"]
-    for candidate in ("xdg-open", "gio"):
-        path = shutil.which(candidate)
-        if path:
-            return [path, "open"] if candidate == "gio" else [path]
-    raise RuntimeError("no xdg-open or gio found to open the URL")
-
-
-def copy(url: str) -> None:
-    for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["pbcopy"]):
-        if shutil.which(cmd[0]):
-            subprocess.run(cmd, input=url, text=True, check=False)
-            return
-    raise RuntimeError("no wl-copy, xclip or pbcopy found to copy the URL")
-
-
-def main() -> int:
-    try:
-        lines = int(os.environ.get("HERDR_URLVIEW_LINES", DEFAULT_LINES))
-    except ValueError:
-        lines = DEFAULT_LINES
-
-    try:
-        pane = source_pane_id()
-        urls = extract(pane_text(pane, lines))
-    except (RuntimeError, json.JSONDecodeError, KeyError) as exc:
-        print(f"herdr-urlview: {exc}", file=sys.stderr)
-        return 1
-
-    if not urls:
-        print(f"herdr-urlview: no URLs in the last {lines} lines of {pane}")
-        # Give the popup a moment to be readable before herdr tears it down.
-        input("press enter to close ")
-        return 0
-
-    try:
-        chosen = pick(urls)
-        if chosen is None:
-            return 0
-        key, url = chosen
-        if key == "ctrl-y":
-            copy(url)
-        else:
-            url = f"https://{url}" if url.startswith("www.") else url
-            subprocess.Popen(
-                opener() + [url],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-    except RuntimeError as exc:
-        print(f"herdr-urlview: {exc}", file=sys.stderr)
-        input("press enter to close ")
-        return 1
-
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+process.exit(main());
