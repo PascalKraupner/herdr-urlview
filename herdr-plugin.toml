@@ -19,4 +19,4 @@ title = "URLs"
 placement = "popup"
 width = "80%"
 height = "60%"
-command = ["bin/herdr-urlview"]
+command = ["./bin/herdr-urlview"]
