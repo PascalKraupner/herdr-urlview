@@ -3,6 +3,7 @@
 // A herdr equivalent of tmux-urlview. Reads the invoking pane's scrollback
 // through the herdr socket API, extracts URLs, and offers them in an fzf picker.
 //
+//	↑ ↓     move, also Ctrl-K and Ctrl-J, wrapping around at both ends
 //	Enter   open in the default browser
 //	Ctrl-Y  copy to the clipboard instead
 //	Esc     cancel
@@ -24,6 +25,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 const defaultLines = 5000
@@ -66,7 +68,14 @@ func run() error {
 
 	urls := extract(text)
 	if len(urls) == 0 {
-		fmt.Printf("herdr-urlview: no URLs in the last %d lines of %s\n", lines, pane)
+		// No pane id and no program name. This is the one thing the reader sees
+		// in a popup that is about to ask them to press enter, and neither tells
+		// them anything they can act on.
+		//
+		// Deliberately no Nerd Font glyph, unlike the picker chrome: this is the
+		// path that runs when there is nothing to show, so it should stay legible
+		// on a terminal without the font rather than opening with a tofu box.
+		fmt.Printf("\n  No links in the last %d lines of output.\n", lines)
 		pause()
 		return nil
 	}
@@ -120,6 +129,14 @@ func sourcePaneID() (string, error) {
 			Pane   struct {
 				PaneID string `json:"pane_id"`
 			} `json:"pane"`
+			// What herdr 0.7.5 actually sends for a plugin pane, and the only one
+			// of the three that is populated in practice. It is the pane that was
+			// focused when the entrypoint was invoked, so it is still the pane the
+			// user was looking at rather than the popup about to open. Without it
+			// this function fell through to the pane list below, by which point
+			// the popup itself is focused, and the picker scanned its own empty
+			// scrollback and reported no links.
+			FocusedPaneID string `json:"focused_pane_id"`
 		}
 		if json.Unmarshal([]byte(raw), &ctx) == nil {
 			if ctx.PaneID != "" {
@@ -127,6 +144,9 @@ func sourcePaneID() (string, error) {
 			}
 			if ctx.Pane.PaneID != "" {
 				return ctx.Pane.PaneID, nil
+			}
+			if ctx.FocusedPaneID != "" {
+				return ctx.FocusedPaneID, nil
 			}
 		}
 	}
@@ -159,14 +179,60 @@ func sourcePaneID() (string, error) {
 }
 
 func paneText(paneID string, lines int) (string, error) {
-	// recent-unwrapped matters: it makes herdr rejoin URLs that the terminal
-	// split across wrapped lines, which is the one thing extract_url was
-	// genuinely better at than a naive regex.
+	// recent-unwrapped matters for shell panes: it makes herdr rejoin URLs that
+	// the terminal split across wrapped lines, which is the one thing
+	// extract_url was genuinely better at than a naive regex.
+	//
+	// For agent panes it is the bug. Agents like Claude Code run on the
+	// alternate screen, which has no scrollback, so herdr can only satisfy a
+	// deep recent-unwrapped read by "harvesting": it injects real wheel-scroll
+	// events into the pane, reads what appears, and scrolls back down
+	// (alt_screen_read.rs, herdr issue 2669). On herdr 0.8.0 that takes up to
+	// 12 seconds, during which the agent's UI visibly scrolls up under the
+	// popup, exactly as if the pane had jumped. It only happens when the agent
+	// is idle, because herdr refuses to harvest a busy pane, which is why the
+	// scroll seemed to spare panes that were streaming.
+	//
+	// The visible screen reads instantly and never touches the pane, at the
+	// cost of only seeing what is on screen. For a picker that is the right
+	// trade: links you cannot see are rarely the ones you want to open.
+	source := sourceFor(paneAgent(paneID))
 	return herdr("pane", "read", paneID,
-		"--source", "recent-unwrapped",
+		"--source", source,
 		"--lines", strconv.Itoa(lines),
 		"--format", "text",
 	)
+}
+
+// sourceFor picks the pane read source: full unwrapped history for normal
+// panes, the visible screen for alternate-screen agents, where a history read
+// would wheel-scroll the agent's UI in front of the user.
+func sourceFor(agent string) string {
+	if agent != "" {
+		return "visible"
+	}
+	return "recent-unwrapped"
+}
+
+// paneAgent returns herdr's detected agent for the pane, "" for a plain pane
+// or when the lookup fails. Failure must never break the picker, so it just
+// means the pane is treated as a normal one.
+func paneAgent(paneID string) string {
+	out, err := herdr("pane", "get", paneID)
+	if err != nil {
+		return ""
+	}
+	var payload struct {
+		Result struct {
+			Pane struct {
+				Agent string `json:"agent"`
+			} `json:"pane"`
+		} `json:"result"`
+	}
+	if json.Unmarshal([]byte(out), &payload) != nil {
+		return ""
+	}
+	return payload.Result.Pane.Agent
 }
 
 func extract(text string) []string {
@@ -204,12 +270,25 @@ func pick(urls []string) (key, url string, err error) {
 	}
 
 	cmd := exec.Command(fzf,
-		"--prompt=url> ",
+		// Nerd Font glyphs: the config assumes Iosevka Nerd Font, which every
+		// terminal in this flake uses.
+		"--prompt= search ",
+		"--pointer=",
 		"--height=100%",
 		"--reverse",
 		"--no-multi",
 		"--expect=ctrl-y",
-		fmt.Sprintf("--header=enter open   ctrl-y copy   (%d found)", len(urls)),
+		// No border and no label on purpose. This runs as a herdr plugin pane,
+		// which herdr already frames and titles "URLs" from the manifest, so
+		// fzf drawing its own bordered box inside that nests two frames and shows
+		// the same title twice.
+		"--info=inline",
+		// Wrap around at both ends, so down on the last entry lands on the
+		// first and up on the first lands on the last.
+		"--cycle",
+		// The movement keys are fzf's own defaults (arrows, plus ctrl-j down and
+		// ctrl-k up); they are only spelled out here so the picker says so.
+		fmt.Sprintf("--header=↑↓ ctrl-j/k  move   ⏎ open   ctrl-y copy   (%d found)", len(urls)),
 	)
 	cmd.Stdin = strings.NewReader(strings.Join(urls, "\n"))
 	cmd.Stderr = os.Stderr // fzf draws on /dev/tty, but let its errors through
@@ -248,10 +327,17 @@ func open(url string) error {
 }
 
 // spawn starts a detached process so the popup can close immediately.
+//
+// Setsid is what actually detaches it. Release only drops Go's handle on the
+// child; it leaves it in this process group, so when herdr tears the popup down
+// and signals the group the handler dies with us. That is why Enter appeared to
+// do nothing while Ctrl-Y worked: copyToClipboard waits, and wl-copy forks a
+// daemon of its own, but xdg-open was killed before it reached the browser.
 func spawn(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		return err
 	}
