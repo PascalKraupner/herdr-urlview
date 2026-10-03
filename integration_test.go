@@ -22,7 +22,7 @@ func TestLiveWrappedURL(t *testing.T) {
 		"HOME": dir, "XDG_CONFIG_HOME": dir, "XDG_STATE_HOME": dir,
 		"HERDR_CONFIG_PATH": filepath.Join(dir, "config.toml"),
 		"HERDR_SOCKET_PATH": filepath.Join(dir, "herdr.sock"),
-		"HERDR_BIN_PATH": bin, "HERDR_SESSION": "", "HERDR_PANE_ID": "",
+		"HERDR_BIN_PATH":    bin, "HERDR_SESSION": "", "HERDR_PANE_ID": "",
 		"HERDR_CLIENT_SOCKET_PATH": filepath.Join(dir, "client.sock"),
 	} {
 		t.Setenv(key, value)
