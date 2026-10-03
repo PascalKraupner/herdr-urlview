@@ -1,58 +1,79 @@
 # herdr-urlview
 
-Pick a URL out of a [herdr](https://herdr.dev) pane and open it. Same idea as
-[tmux-urlview](https://github.com/tmux-plugins/tmux-urlview), independently
-implemented against herdr's socket API and sharing no code with it. Where
-tmux-urlview shells out to `urlview` or `extract_url`, this does the extraction
-itself and uses `fzf` for the picker.
-
-Reads the invoking pane's scrollback through herdr's socket API, extracts URLs,
-and offers them in an `fzf` picker, newest first.
-
-| Key | Action |
-|---|---|
-| `enter` | open in the default browser |
-| `ctrl-y` | copy to the clipboard instead |
-| `esc` | cancel |
+Open or copy a URL from the pane you're looking at in [herdr](https://herdr.dev).
+Like tmux-urlview, with an fzf picker. Links appear newest first, without duplicates.
 
 ## Install
 
-As a herdr plugin:
+Requires herdr **0.9.3+**, Git, curl, tar, and [fzf](https://github.com/junegunn/fzf).
+Linux and macOS are supported, on Intel/AMD and ARM64.
 
 ```bash
 herdr plugin install PascalKraupner/herdr-urlview
 ```
 
-Or as a plain keybinding, without the plugin system. Put `bin/herdr-urlview`
-somewhere on `PATH` and add to `~/.config/herdr/config.toml`:
+Installation downloads a prebuilt binary and checks its SHA-256 checksum.
+If no release asset is available, it builds from source with Go 1.26+.
+
+Add this to `~/.config/herdr/config.toml`:
 
 ```toml
 [[keys.command]]
 key = "prefix+u"
-type = "popup"
-command = "herdr-urlview"
-width = "80%"
-height = "60%"
+type = "shell"
+command = "herdr plugin pane open --plugin urlview --entrypoint pick"
 ```
 
-## Requirements
+Reload the config with `herdr server reload-config`, then press your prefix and
+`u`. Type to filter the list.
 
-- `fzf`
-- `xdg-open` or `gio` on Linux, `open` on macOS
-- `wl-copy`, `xclip` or `pbcopy` for the copy binding
-- nothing else; it is a static Go binary
+| Key | Action |
+| --- | --- |
+| Enter | Open in your default browser |
+| Ctrl-Y | Copy to the clipboard |
+| ↑ / ↓ or Ctrl-K / Ctrl-J | Move through links |
+| Esc | Close |
 
-## Configuration
+Opening uses `xdg-open` or `gio` on Linux and `open` on macOS.
+Copying uses `wl-copy` on Wayland, `xclip` on X11, or `pbcopy` on macOS.
 
-`HERDR_URLVIEW_LINES` sets how much scrollback to scan. Default `5000`.
+## Wrapped links and history
 
-## Notes
+The picker reads herdr's unwrapped terminal buffer, so a URL that wraps onto
+several terminal rows stays one link. ANSI styling is removed before extraction.
+Actual newlines remain boundaries; the plugin does not guess whether separate
+lines of text were meant to be joined.
 
-URL matching is deliberately conservative. Terminals wrap and decorate output,
-so a more permissive pattern produces more false positives than real links it
-recovers. Trailing prose punctuation is stripped, but a closing parenthesis is
-kept when the URL has an unmatched opening one, so
-`https://en.wikipedia.org/wiki/Foo_(bar)` survives.
+In a normal shell, it scans up to 1,000 recent rows. In an alternate-screen app
+such as a coding agent, only the current buffer is available. Opening the picker
+does not wheel-scroll the agent to fetch older output.
+
+Set `HERDR_URLVIEW_LINES` to scan fewer rows. The default is `1000`, herdr's
+maximum. Supported prefixes are `http://`, `https://`, `ftp://`, `file://`, and
+`www.`. Trailing prose punctuation is removed; balanced parentheses are kept.
+
+## Update or remove
+
+Re-run the install command to update, or pin a release with `--ref v0.2.0`.
+
+```bash
+herdr plugin uninstall urlview
+```
+
+## Development
+
+```bash
+go test ./...
+go build -o bin/herdr-urlview .
+herdr plugin link .
+```
+
+Run the wrapped-link integration test with
+`HERDR_TEST_BIN="$(command -v herdr)" go test -v -run TestLive`.
+It starts an isolated test server.
+
+Tested against herdr 0.9.3. Reports with sample output and the herdr version are
+welcome in [Issues](https://github.com/PascalKraupner/herdr-urlview/issues).
 
 ## License
 

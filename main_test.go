@@ -1,7 +1,10 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -86,18 +89,35 @@ func TestSourcePaneIDPrefersEnv(t *testing.T) {
 	}
 }
 
-// Agent panes must be read from the visible screen. A recent-unwrapped read of
-// an idle alternate-screen agent makes herdr harvest history by wheel-scrolling
-// the agent's UI up and back in front of the user (herdr issue 2669), which
-// was reported as "the pane scrolls when the picker opens".
-func TestSourceFor(t *testing.T) {
-	if got := sourceFor("claude"); got != "visible" {
-		t.Errorf("sourceFor(claude) = %q, want visible", got)
+func TestPaneTextUsesNonScrollingUnwrappedRead(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "herdr")
+	// Model herdr's unwrapped snapshot: styling may interrupt a long URL,
+	// but a real newline before prose must remain a URL boundary.
+	script := `#!/bin/sh
+test "$*" = 'pane read w1:p1 --source recent-unwrapped --lines 1000 --format ansi' || exit 1
+printf '\033[34mhttps://example.com/a/very/long/\033[0mpath?token=123456789&next=page\nprose\n'
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if got := sourceFor("opencode"); got != "visible" {
-		t.Errorf("sourceFor(opencode) = %q, want visible", got)
+	t.Setenv("HERDR_BIN_PATH", bin)
+	text, err := paneText("w1:p1", 1000)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := sourceFor(""); got != "recent-unwrapped" {
-		t.Errorf("sourceFor(shell) = %q, want recent-unwrapped", got)
+	want := []string{"https://example.com/a/very/long/path?token=123456789&next=page"}
+	if got := extract(text); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestStripHyperlinkStyling(t *testing.T) {
+	for _, terminator := range []string{"\a", "\x1b\\"} {
+		text := "\x1b]8;;https://hidden.example" + terminator + "https://example.com/\x1b[1mpath\x1b[0m\x1b]8;;" + terminator
+		got := ansiRe.ReplaceAllString(text, "")
+		if got != "https://example.com/path" || strings.Contains(got, "\x1b") {
+			t.Fatalf("unexpected stripped text: %q", got)
+		}
 	}
 }

@@ -8,7 +8,7 @@
 //	Ctrl-Y  copy to the clipboard instead
 //	Esc     cancel
 //
-// HERDR_URLVIEW_LINES sets how much scrollback to scan (default 5000).
+// HERDR_URLVIEW_LINES sets how much scrollback to scan (default 1000).
 //
 // Go rather than a scripting language so the published plugin ships as a static
 // binary and needs no runtime on the installing machine.
@@ -28,7 +28,7 @@ import (
 	"syscall"
 )
 
-const defaultLines = 5000
+const defaultLines = 1000 // herdr caps recent reads at 1000 rendered rows
 
 // Punctuation far more likely to be prose than part of the URL.
 const trailing = ".,;:!?'\")]}>"
@@ -39,6 +39,10 @@ const trailing = ".,;:!?'\")]}>"
 const notURL = `[^\s<>"'` + "`" + `\[\]{}|\\^]+`
 
 var urlRe = regexp.MustCompile(`(?i)(?:https?|ftp|file)://` + notURL + `|www\.` + notURL)
+
+// CSI styling and OSC strings (including hyperlink wrappers). Removing these
+// after herdr unwraps terminal rows preserves URLs split by a style change.
+var ansiRe = regexp.MustCompile("\x1b\\[[0-?]*[ -/]*[@-~]|\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)")
 
 func main() {
 	if err := run(); err != nil {
@@ -179,60 +183,15 @@ func sourcePaneID() (string, error) {
 }
 
 func paneText(paneID string, lines int) (string, error) {
-	// recent-unwrapped matters for shell panes: it makes herdr rejoin URLs that
-	// the terminal split across wrapped lines, which is the one thing
-	// extract_url was genuinely better at than a naive regex.
-	//
-	// For agent panes it is the bug. Agents like Claude Code run on the
-	// alternate screen, which has no scrollback, so herdr can only satisfy a
-	// deep recent-unwrapped read by "harvesting": it injects real wheel-scroll
-	// events into the pane, reads what appears, and scrolls back down
-	// (alt_screen_read.rs, herdr issue 2669). On herdr 0.8.0 that takes up to
-	// 12 seconds, during which the agent's UI visibly scrolls up under the
-	// popup, exactly as if the pane had jumped. It only happens when the agent
-	// is idle, because herdr refuses to harvest a busy pane, which is why the
-	// scroll seemed to spare panes that were streaming.
-	//
-	// The visible screen reads instantly and never touches the pane, at the
-	// cost of only seeing what is on screen. For a picker that is the right
-	// trade: links you cannot see are rarely the ones you want to open.
-	source := sourceFor(paneAgent(paneID))
-	return herdr("pane", "read", paneID,
-		"--source", source,
+	// Text history reads can wheel-scroll idle alternate-screen agents. ANSI
+	// reads use the existing terminal buffer without harvesting; herdr joins
+	// soft-wrapped rows for us, then we remove styling before matching URLs.
+	text, err := herdr("pane", "read", paneID,
+		"--source", "recent-unwrapped",
 		"--lines", strconv.Itoa(lines),
-		"--format", "text",
+		"--format", "ansi",
 	)
-}
-
-// sourceFor picks the pane read source: full unwrapped history for normal
-// panes, the visible screen for alternate-screen agents, where a history read
-// would wheel-scroll the agent's UI in front of the user.
-func sourceFor(agent string) string {
-	if agent != "" {
-		return "visible"
-	}
-	return "recent-unwrapped"
-}
-
-// paneAgent returns herdr's detected agent for the pane, "" for a plain pane
-// or when the lookup fails. Failure must never break the picker, so it just
-// means the pane is treated as a normal one.
-func paneAgent(paneID string) string {
-	out, err := herdr("pane", "get", paneID)
-	if err != nil {
-		return ""
-	}
-	var payload struct {
-		Result struct {
-			Pane struct {
-				Agent string `json:"agent"`
-			} `json:"pane"`
-		} `json:"result"`
-	}
-	if json.Unmarshal([]byte(out), &payload) != nil {
-		return ""
-	}
-	return payload.Result.Pane.Agent
+	return ansiRe.ReplaceAllString(text, ""), err
 }
 
 func extract(text string) []string {
@@ -270,10 +229,8 @@ func pick(urls []string) (key, url string, err error) {
 	}
 
 	cmd := exec.Command(fzf,
-		// Nerd Font glyphs: the config assumes Iosevka Nerd Font, which every
-		// terminal in this flake uses.
-		"--prompt= search ",
-		"--pointer=",
+		"--prompt=search > ",
+		"--pointer=>",
 		"--height=100%",
 		"--reverse",
 		"--no-multi",
